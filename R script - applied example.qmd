@@ -1,0 +1,397 @@
+--- 
+title: "Script for applied example in: "
+subtitle: Propensity-based standardization to enhance the validation and interpretation of prediction model discrimination for a target population
+
+author:
+  - name: Valentijn M.T. de Jong*
+  - name: Jeroen Hoogland*
+  - name: Karel G.M. Moons
+  - name: Richard D. Riley
+  - name: Tri-Long Nguyen**
+  - name: Thomas P.A. Debray**
+  
+date: 26 February 2023
+
+abstract: V.M.T.deJong-2@umcutrecht.nl
+abstract-title: Contact
+
+format:
+  html:
+    embed-resources: true
+    toc: true
+---
+
+_\* Contributed equally and \*\* Contributed equally_
+
+This is a script for reproducing the analyses in the manuscript. As the data are not publicly available, we use the DVTipd dataset in the metamisc R package. As this is a synthetic dataset, the results do not match the results presented in the main manuscript. This script is available from [github.com/VMTdeJong/wAUC-applied-example](https://github.com/VMTdeJong/wAUC-applied-example). The code for replicating the simulation study is available from [github.com/VMTdeJong/wAUC-sim](https://github.com/VMTdeJong/wAUC-sim).
+
+### Functions
+
+We need the following packages. You can also download the wAUC package from github manually and load its functions into R.
+
+```{r, eval = FALSE}
+library(devtools)
+install_github("https://github.com/VMTdeJong/wAUC")
+```
+
+```{r}
+library(plyr)
+library(wAUC) 
+library(ggplot2)   # for figures
+library(metamisc)  # for meta-analysis
+library(nnet)      # multinomial regression
+library(knitr)     # for tables
+library(gridExtra) # For making one plot with multiple subplots in ggplot2
+``` 
+
+Open the following code block to view the functions we used for meta-analysis.
+```{r}
+#| code-fold: true
+
+weighted_validate <- function(model, newdata, weights_name, I = 5000) {
+  outcome <- as.character(model$formula[[2]])
+  pp <- predict(model, newdata, type = "response")
+  lp <- predict(model, newdata, type = "link")
+  ws <- newdata[ , weights_name]
+
+  list(auc = wAUC(y = newdata[ , outcome], p = pp, w = ws, I = I))
+}
+
+meta_analyze_auc <- function(x, clusters) {
+  out <- valmeta(cstat =      unlist(lapply(x, `[[`, "estimate")), 
+                 cstat.cilb = unlist(lapply(x, `[[`, "ci.lb")), 
+                 cstat.ciub = unlist(lapply(x, `[[`, "ci.ub")), 
+                 cstat.cilv = 0.95, 
+                 slab = clusters)
+  
+  if (any(unlist(lapply(x, `[[`, "ci.ub")) < unlist(lapply(x, `[[`, "est"))))
+    stop("ci.ub must be greater than the point estimate")
+  
+  if (any(unlist(lapply(x, `[[`, "ci.lb")) > unlist(lapply(x, `[[`, "est"))))
+    stop("ci.lb must be lower than the point estimate")
+  
+  out$tau2 <- out$fit$tau2
+  out
+}
+
+meta_validate <- function(model, data, cluster_name, weights_name, I = 5000) {
+  vals <- list()
+  clusters <- sort(unique(data[ , cluster_name]))
+  for (cl in seq_along(clusters))
+    vals[[cl]] <- weighted_validate(model, data[data[ , cluster_name] %in% clusters[cl], ], weights_name = weights_name, I = I)
+  
+  out <- list()
+  out$auc   <- meta_analyze_auc(lapply(vals, `[[`,"auc"), clusters)
+
+  out
+}
+
+mm_validate <- function(models, data, cluster_name, weights_name, I = 5000) {
+  out <- list()
+  if (is.null(n <- names(models))) n <- LETTERS
+  for (m in seq_along(models))
+    out[[n[m]]] <- meta_validate(models[[m]], data, cluster_name, weights_name, I = I)
+  out
+}
+```
+
+And the functions to display results:
+
+```{r}
+#| code-fold: true
+
+paste_est <- function(object, stat, digits, ...)
+  with(object[[stat]], 
+       paste(
+         round(est, digits = digits), 
+         sep = "", ...))
+
+get_est_ci_values <- function(object, stat, digits, ...)
+  with(object[[stat]], data.frame(est, ci.lb, ci.ub, pi.lb, pi.ub))
+
+get_df_est_ci <- function(x, stat) {
+  names <- data.frame(names = names(lapply(x, get_est_ci_values, stat)))
+  values <- Reduce(rbind, lapply(x, get_est_ci_values, stat))
+  cbind(names = names, values, model = seq_len(nrow(names)))
+}
+
+get_tau_ci_values <- function(object, stat, digits, ...) {
+  if (stat == "auc")
+    x <- object[[stat]][["fit"]]
+  else
+    x <- object[[stat]]
+  out <- with(x, data.frame(est = tau2,
+                            ci.lb = max(0, tau2 + qnorm(.025) * se.tau2),
+                            ci.ub =        tau2 + qnorm(.975) * se.tau2))
+  sqrt(out)
+}
+
+
+get_df_tau_ci <- function(x, stat) {
+  names <- data.frame(names = names(lapply(x, get_tau_ci_values, stat)))
+  values <- Reduce(rbind, lapply(x, get_tau_ci_values, stat))
+  cbind(names = names, values, model = seq_len(nrow(names)))
+}
+
+paste_ci <- function(object, stat, digits, ...)
+  with(object[[stat]], 
+       paste(
+         round(ci.lb, digits = digits), 
+         " : ", 
+         round(ci.ub, digits = digits), 
+         sep = "", ...))
+
+paste_pi <- function(object, stat, digits, ...)
+  with(object[[stat]], 
+       paste(
+         round(pi.lb, digits = digits), 
+         " : ", 
+         round(pi.ub, digits = digits), 
+         sep = "", ...))
+
+paste_tau <- function(object, stat, digits, ...) 
+  with(object[[stat]], paste(round(sqrt(tau2), digits = digits), sep = "", ...)) 
+
+
+paste_i2 <- function(object, stat, digits, ...) 
+  paste(round(object[[stat]]$fit$I2, digits = digits), "%", sep = "", ...)
+
+paste_res <- function(x, stat, digits, ...) {
+  rbind(
+    data.frame(lapply(x, FUN = paste_est, stat = stat, digits = digits), row.names = "Summary estimate"),
+    data.frame(lapply(x, FUN = paste_ci,  stat = stat, digits = digits), row.names = "Confidence interval"),
+    data.frame(lapply(x, FUN = paste_pi,  stat = stat, digits = digits), row.names = "Prediction interval"),
+    data.frame(lapply(x, FUN = paste_tau, stat = stat, digits = digits), row.names = "Tau"),
+    data.frame(lapply(x, FUN = paste_i2,  stat = stat, digits = digits), row.names = "I^2"))
+}
+
+plot_models <- function(object, statistic, refline = NULL, legend = F, pi = FALSE,
+                        legend.position = "bottom") {
+  p <- ggplot(object, aes(x = model, y = est, group = weighted, color = weighted)) 
+  
+  # Start with refline, because we want it on the background
+  if (!is.null(refline)) 
+    p <- p + geom_hline(mapping = NULL, data = NULL, yintercept = refline, na.rm = FALSE, 
+                        show.legend = NA, linetype = "dashed")
+  
+  p <- p +
+    geom_point(aes(shape = weighted), size = 3,
+               position=position_dodge(0.25)) +
+    scale_x_continuous(breaks = 1:8) +
+    geom_errorbar(aes(ymin = ci.lb, ymax = ci.ub), width=.50, 
+                  position=position_dodge(0.25)) +
+    labs(title = "", # title = paste(statistic, " for 8 models in 12 external validation studies", sep = "") 
+         x="Model", y = statistic) +
+    theme_classic() +
+    theme(text = element_text(size = 15)) + 
+    theme(legend.position = legend.position) +
+    scale_color_manual(values = c("#FFB000", "#648FFF"))
+  
+  if (pi)
+    p <- p + geom_errorbar(aes(ymin = pi.lb, ymax = pi.ub), width=.25, size = .25, 
+                           position=position_dodge(.25))
+  
+  p
+}
+
+make_table <- function(data,  
+                       selected_vars = c("sex", "oachst", "malign", "surg", "notraum", "vein", "calfdif3", "ddimdich", "dvt"),
+                       new_var_names = c("Male", "Oral contraceptive (OC)", "Presence of malignancy",
+                                         "Recent surgery or bedridden", "Absence of leg trauma", "Vein distension", 
+                                         "Calf difference >= 3cm", "D-dimer abnormal", "DVT presence")) {
+  if (nrow(data) == 0L)
+    return(NULL) 
+  
+  data <- as.list(data[ , selected_vars])
+  names(data) <- new_var_names 
+  tab <- t(sapply(data, table))
+  colnames(tab) <- c("No", "Yes")
+  tab
+}
+
+make_table1 <- function(data) {
+  tab <- make_table(data)
+  
+  # Pct yes
+  pct_yes <- cbind("", paste0("(", round(tab[ ,2]/rowSums(tab)*100), "%)"))
+  tab[] <- paste0(tab, pct_yes) 
+  tab
+}
+
+min_max_pct <- function(data, 
+                        cluster) {
+  data_sets <- split(data, cluster)
+  data_sets[(sapply(data_sets, function(x) nrow(x) == 0))] <- NULL # Removes the empty Oudega study (= dev sample)
+  tabs <- lapply(data_sets, make_table)
+  pcts <- sapply(tabs, function(x) round(x[ ,2]/rowSums(x)*100))
+  
+  mins <- apply(pcts, 1, min)
+  maxs <- apply(pcts, 1, max)
+  
+  paste0(mins,"% - ", maxs, "%")
+}
+``` 
+
+# Data
+We define the variable names
+```{r}
+cluster <- "study"
+predictors <- "sex + oachst + malign + surg + notraum + vein + calfdif3 + ddimdich"
+
+outcome <- "dvt"
+
+cluster_dvl <- "a"
+```
+
+
+Load the data and split into development and validation data.             
+```{r}
+set.seed(2034482)
+
+data("DVTipd")
+dat_dvt <- DVTipd
+
+# Select the development data
+dat_dvl <- subset(dat_dvt, study == cluster_dvl)
+
+# Select the validation data
+dat_val <- subset(dat_dvt, study != cluster_dvl)
+``` 
+
+#### Table 1
+
+```{r}
+tab1 <- cbind(make_table1(dat_dvl),
+              make_table1(dat_val),
+              "Range" = min_max_pct(dat_val, dat_val$study))
+kable(tab1)
+``` 
+
+# Model development
+#### Develop a single model
+Fit the prediction model. We do this just to get the order of the size of the coefficients, and their variable names.
+```{r}
+fmla_dvl <- paste(outcome, "~", predictors)
+fit <- glm(fmla_dvl, data = dat_dvl, family = binomial())
+dvl_coefs <- data.frame(Coefficient = names(coef(fit)), Estimate = round(coef(fit), 2), row.names = NULL)
+```
+
+#### Develop multiple models
+We shall develop multiple prediction models. We start by using only the predictor with the largest coefficient and add the next largest coefficient for each consecutive model.
+```{r}
+# Sort the variables by coef size
+names(sort(coef(fit)[-1], decreasing = T))
+# R has changed the names of the predictors, so here they are manually:
+pred_names <- c("ddimdich", "calfdif3", "oachst", "sex", "notraum", "vein", "malign", "surg")
+
+# Create the model formulas accordingly
+f_list <- list()
+for (i in seq_along(pred_names))
+  f_list[[i]] <- formula(dat_dvl[ , c("dvt", pred_names[seq_len(i)]) ])
+
+# Fit the models
+m_list <- list()
+for (i in seq_along(f_list))
+  m_list[[pred_names[i]]] <- glm(f_list[[i]], family = binomial, data = dat_dvl)
+
+# Make table for coefficients of different models
+coefs <- do.call(rbind.fill, sapply(m_list, function(x) as.data.frame(matrix(round(coef(x), 3), nrow = 1))))
+coefs <- round(coefs, 2)
+colnames(coefs) <- c("Intercept", pred_names)
+coefs[is.na(coefs)] <- ""
+kable(coefs)
+```
+
+# Compute propensity weights
+```{r}
+fmla_multinom <- paste(cluster, "~", outcome, "+", predictors)
+fit_prop <- multinom(fmla_multinom, data = dat_dvt)
+
+n_val_studies <- length(unique(dat_val[,cluster]))
+dat_val$prop_dvl <- dat_val$prop_act <- dat_val$w <- NA
+
+
+for (i in 1:n_val_studies) {
+  study_i <- as.character(unique(dat_val[,cluster])[i])
+
+  dat_ps_i <- subset(dat_dvt, study %in% c(cluster_dvl, as.character(unique(dat_val[,cluster])[i])))
+
+  # Calculate LP
+  dat_ps_i$lp <- predict(fit, newdata = dat_ps_i, type = "link")
+
+  # Calculate the propensity for being in the development sample
+  dat_ps_i$prop_dvl <- predict(fit_prop, newdata = dat_ps_i, type = "probs")[,cluster_dvl] # propensities
+  dat_val$prop_dvl[dat_val[,cluster] == study_i] <- dat_ps_i$prop_dvl[dat_ps_i[,cluster] == study_i]
+
+  # Calculate the propensity for being in the current validation sample
+  dat_ps_i$prop_val <- predict(fit_prop, newdata = dat_ps_i, type = "probs")[,study_i]
+  dat_val$prop_act[dat_val[,cluster] == study_i] <- dat_ps_i$prop_val[dat_ps_i[,cluster] == study_i]
+}
+
+# Construct the weights
+dat_val$w <- dat_val$prop_dvl/dat_val$prop_act
+```
+
+# Model validation
+```{r}
+dat_val$unweighted <- 1
+I <- 5000
+val_unweighd <- mm_validate(m_list, dat_val, "study", "unweighted", I = I)
+val_weighted <- mm_validate(m_list, dat_val, "study", "w", I = I)
+
+auc_table_u  <- paste_res(val_unweighd, "auc", digits = 2)
+auc_table_w  <- paste_res(val_weighted, "auc", digits = 2)
+```
+
+:::{.column-body-outset}
+The unweighted estimates are:
+```{r}
+kable(auc_table_u)
+``` 
+
+The weighted estimates are
+```{r}
+kable(auc_table_w)
+```
+:::
+
+#### Make figure
+
+```{r, warning = FALSE}
+## Point estimates
+# c-stat
+c.est.ci <- cbind(get_df_est_ci(val_unweighd, "auc"), weighted = F)
+c.est.ci <- rbind(c.est.ci, cbind(get_df_est_ci(val_weighted, "auc"), weighted = T))
+
+## Tau
+# c-stat
+c.tau.ci <- cbind(get_df_tau_ci(val_unweighd, "auc"), weighted = F)
+c.tau.ci <- rbind(c.tau.ci, cbind(get_df_tau_ci(val_weighted, "auc"), weighted = T))
+
+### One big figure
+# C-stat
+c.est.ci$weighted[c.est.ci$weighted == TRUE] <- "Yes"
+c.est.ci$weighted[c.est.ci$weighted == "FALSE"] <- "No"
+
+c.tau.ci$weighted[c.tau.ci$weighted == TRUE] <- "Yes"
+c.tau.ci$weighted[c.tau.ci$weighted == "FALSE"] <- "No"
+
+
+p11 <- plot_models(c.est.ci, "Summary c-statistic", legend.position = c(.85, .20), pi = TRUE)
+p12 <- plot_models(c.tau.ci, "Tau for logit c-statistic", legend.position = "none")
+
+grid.arrange(p11, p12, ncol = 2)
+```
+
+# Footnotes
+#### Acknowledgements
+
+::: {layout="[[10,90]]"}
+![](flag_eu.png)
+
+This project has received funding from the European Union’s Horizon 2020 research and innovation programme
+under ReCoDID grant agreement No 825746.
+:::
+
+#### Disclaimer
+The views expressed in this paper are the personal views of the authors and may not be understood or quoted as being made on behalf of or reflecting the position of the regulatory agency/agencies or organizations with which the authors are employed/affiliated.
